@@ -19,6 +19,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "yt-dlp GUI",
         options,
-        Box::new(|cc| Ok(Box::new(YtDlpApp::new(cc)) as Box<dyn eframe::App>)),
+        Box::new(|cc| Box::new(YtDlpApp::new(cc)) as Box<dyn eframe::App>),
     )
 }
