@@ -585,6 +585,15 @@ impl YtDlpApp {
                     )
                     .weak(),
                 );
+            } else if let Some(count) = self.video_info.as_ref().and_then(|i| i.playlist_count) {
+                ui.label(
+                    RichText::new(format!(
+                        "Список составлен по первому видео плейлиста ({count} шт.). \
+                         Выбранная дорожка будет применена ко всем видео плейлиста; \
+                         если для какого-то видео её нет — возьмётся дорожка по умолчанию."
+                    ))
+                    .weak(),
+                );
             }
         });
     }

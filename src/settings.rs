@@ -270,32 +270,73 @@ impl DownloadSettings {
             args.push("-f".into());
             args.push(fmt);
         } else {
-            // Видео: собираем format selector
+            // Видео: собираем format selector.
+            // Строим список АЛЬТЕРНАТИВ явно (а не пытаемся встроить fallback
+            // внутрь одной альтернативы через "a/b+c") — в синтаксисе yt-dlp
+            // "+" имеет более высокий приоритет, чем "/", поэтому
+            // "bestvideo+bestaudio[language=ru]/bestaudio/best" на самом деле
+            // означает "видео+ауд(ru) ИЛИ просто ауд(любой, без видео!) ИЛИ best" —
+            // что могло приводить к скачиванию одного аудио без видео, если
+            // нужный язык недоступен. Явный список альтернатив это исключает.
             let height = self.resolution.height_filter();
             let lang = self.audio_language.trim();
-
-            let video_part = match height {
-                Some(h) => format!("bestvideo[height<={h}]"),
-                None => "bestvideo".to_string(),
-            };
-            let audio_part = if lang.is_empty() {
-                "bestaudio".to_string()
+            let lang_filter = if lang.is_empty() {
+                String::new()
             } else {
-                format!("bestaudio[language={lang}]/bestaudio")
+                format!("[language={lang}]")
             };
+            let height_filter = height.map(|h| format!("[height<={h}]")).unwrap_or_default();
 
-            let selector = match self.resolution {
-                Resolution::Worst => "worstvideo+worstaudio/worst".to_string(),
-                _ => format!("{video_part}+{audio_part}/best"),
-            };
+            let mut alts: Vec<String> = Vec::new();
+
+            if self.resolution == Resolution::Worst {
+                if !lang_filter.is_empty() {
+                    alts.push(format!("worstvideo+worstaudio{lang_filter}"));
+                }
+                alts.push("worstvideo+worstaudio".to_string());
+                alts.push("worst".to_string());
+            } else {
+                match self.video_container {
+                    // MP4 нативно поддерживает только H.264/H.265 видео и
+                    // AAC(m4a) аудио без перекодирования. Если просто взять
+                    // "bestaudio" (это часто Opus в контейнере WebM) и потом
+                    // силой засунуть его в mp4 через --remux-video, звук
+                    // может потеряться или ffmpeg завершится с ошибкой.
+                    // Поэтому для MP4 сначала просим совместимые форматы.
+                    VideoContainer::Mp4 => {
+                        if !lang_filter.is_empty() {
+                            alts.push(format!(
+                                "bestvideo[ext=mp4]{height_filter}+bestaudio[ext=m4a]{lang_filter}"
+                            ));
+                        }
+                        alts.push(format!(
+                            "bestvideo[ext=mp4]{height_filter}+bestaudio[ext=m4a]"
+                        ));
+                        alts.push(format!("best[ext=mp4]{height_filter}"));
+                        if !lang_filter.is_empty() {
+                            alts.push(format!("bestvideo{height_filter}+bestaudio{lang_filter}"));
+                        }
+                        alts.push(format!("bestvideo{height_filter}+bestaudio"));
+                    }
+                    _ => {
+                        if !lang_filter.is_empty() {
+                            alts.push(format!("bestvideo{height_filter}+bestaudio{lang_filter}"));
+                        }
+                        alts.push(format!("bestvideo{height_filter}+bestaudio"));
+                    }
+                }
+                alts.push("best".to_string());
+            }
 
             args.push("-f".into());
-            args.push(selector);
+            args.push(alts.join("/"));
 
             if let Some(ext) = self.video_container.ext() {
+                // Только merge-output-format: он просит ffmpeg смержить уже
+                // подобранные (совместимые) потоки в нужный контейнер.
+                // Дополнительный --remux-video здесь не нужен — раньше он
+                // как раз приводил к потере звука и коду ошибки 1.
                 args.push("--merge-output-format".into());
-                args.push(ext.to_string());
-                args.push("--remux-video".into());
                 args.push(ext.to_string());
             }
         }
