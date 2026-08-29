@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
@@ -116,6 +116,13 @@ pub fn spawn_download(
 
     let mut cmd = Command::new(&ytdlp_path);
     cmd.args(&args)
+        // Форсируем UTF-8 для stdout/stderr Python-процесса yt-dlp.
+        // Без этого на Windows, если системная кодовая страница консоли
+        // (напр. cp1251), а в названии видео/логе встречается символ,
+        // не представимый в этой кодировке, Python падает с
+        // "OSError: [Errno 22] Invalid argument" при попытке что-либо напечатать.
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -201,3 +208,100 @@ fn read_stream<R: std::io::Read + Send + 'static>(stream: R, tx: Sender<Download
 
 /// Утилита для канала, использующаяся в app.rs
 pub type EventReceiver = Receiver<DownloadEvent>;
+
+// --- Анализ ссылки (название, превью, кол-во видео в плейлисте) ------------
+
+#[derive(Debug, Clone)]
+pub struct VideoInfo {
+    pub title: String,
+    pub thumbnail_url: Option<String>,
+    /// Заполнено, только если ссылка ведёт на плейлист.
+    pub playlist_count: Option<u64>,
+}
+
+/// Быстро получает метаданные по ссылке без скачивания самого видео.
+/// Используем `--playlist-items 1`, чтобы не парсить весь плейлист целиком —
+/// yt-dlp всё равно кладёт в JSON первого элемента поле `playlist_count`,
+/// если ссылка ведёт на плейлист.
+pub fn analyze_url(ytdlp_path: &PathBuf, url: &str) -> anyhow::Result<VideoInfo> {
+    let mut cmd = Command::new(ytdlp_path);
+    cmd.args([
+        "--skip-download",
+        "--no-warnings",
+        "--no-progress",
+        "--playlist-items",
+        "1",
+        "--dump-single-json",
+        url,
+    ])
+    .env("PYTHONIOENCODING", "utf-8")
+    .env("PYTHONUTF8", "1")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last_line = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("не удалось получить информацию о ссылке");
+        anyhow::bail!("{last_line}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // На всякий случай берём первую строку, похожую на JSON-объект.
+    let json_line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or(stdout.as_ref());
+    let value: serde_json::Value = serde_json::from_str(json_line)?;
+
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Без названия")
+        .to_string();
+
+    let thumbnail_url = value
+        .get("thumbnail")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            value
+                .get("thumbnails")
+                .and_then(|t| t.as_array())
+                .and_then(|arr| arr.last())
+                .and_then(|t| t.get("url"))
+                .and_then(|u| u.as_str())
+                .map(String::from)
+        });
+
+    let playlist_count = value.get("playlist_count").and_then(|v| v.as_u64());
+
+    Ok(VideoInfo {
+        title,
+        thumbnail_url,
+        playlist_count,
+    })
+}
+
+/// Скачивает превью-изображение по URL и декодирует его в сырые RGBA-байты,
+/// готовые к загрузке в текстуру egui.
+pub fn fetch_thumbnail(url: &str) -> anyhow::Result<(Vec<u8>, [usize; 2])> {
+    let response = ureq::get(url).call()?;
+    let mut bytes = Vec::new();
+    response.into_reader().read_to_end(&mut bytes)?;
+
+    let image = image::load_from_memory(&bytes)?.to_rgba8();
+    let (width, height) = image.dimensions();
+    Ok((image.into_raw(), [width as usize, height as usize]))
+}

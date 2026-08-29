@@ -1,12 +1,19 @@
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use egui::{Color32, RichText, Rounding, Stroke};
 
 use crate::downloader::{self, DownloadEvent};
 use crate::settings::{AudioFormat, DownloadSettings, PlaylistMode, Resolution, VideoContainer};
+
+/// Акцентный цвет интерфейса (#393636) — используется вместо синего.
+const ACCENT_COLOR: Color32 = Color32::from_rgb(0x39, 0x36, 0x36);
+const ACCENT_COLOR_HOVER: Color32 = Color32::from_rgb(0x4a, 0x46, 0x46);
 
 pub struct YtDlpApp {
     settings: DownloadSettings,
@@ -18,14 +25,21 @@ pub struct YtDlpApp {
     running_child: Option<Child>,
     rx: Option<Receiver<DownloadEvent>>,
     tx: Option<Sender<DownloadEvent>>,
+    log_file: Option<BufWriter<File>>,
 
-    log: Vec<String>,
     progress: f32,
     speed: String,
     eta: String,
     playlist_item: String,
     status: Status,
 
+    // Анализ ссылки (название/превью/кол-во видео)
+    analyze_status: AnalyzeStatus,
+    analyze_rx: Option<Receiver<AnalyzeEvent>>,
+    video_info: Option<VideoPreview>,
+    thumbnail_texture: Option<egui::TextureHandle>,
+
+    show_settings: bool,
     show_advanced: bool,
 }
 
@@ -36,6 +50,32 @@ enum Status {
     Done,
     Error(String),
 }
+
+#[derive(PartialEq)]
+enum AnalyzeStatus {
+    Idle,
+    Loading,
+    Loaded,
+    Error(String),
+}
+
+struct VideoPreview {
+    title: String,
+    playlist_count: Option<u64>,
+}
+
+struct ThumbnailData {
+    rgba: Vec<u8>,
+    size: [usize; 2],
+}
+
+struct AnalyzedInfo {
+    title: String,
+    playlist_count: Option<u64>,
+    thumbnail: Option<ThumbnailData>,
+}
+
+type AnalyzeEvent = Result<AnalyzedInfo, String>;
 
 impl YtDlpApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -55,13 +95,91 @@ impl YtDlpApp {
             running_child: None,
             rx: None,
             tx: None,
-            log: Vec::new(),
+            log_file: None,
             progress: 0.0,
             speed: String::new(),
             eta: String::new(),
             playlist_item: String::new(),
             status: Status::Idle,
+            analyze_status: AnalyzeStatus::Idle,
+            analyze_rx: None,
+            video_info: None,
+            thumbnail_texture: None,
+            show_settings: false,
             show_advanced: false,
+        }
+    }
+
+    fn log_line(&mut self, line: &str) {
+        if let Some(writer) = self.log_file.as_mut() {
+            let _ = writeln!(writer, "{line}");
+            let _ = writer.flush();
+        }
+    }
+
+    fn start_analyze(&mut self) {
+        let Some(ytdlp) = self.ytdlp_path.clone() else {
+            self.analyze_status = AnalyzeStatus::Error("yt-dlp не готов".into());
+            return;
+        };
+        let url = self.settings.url.trim().to_string();
+        if url.is_empty() {
+            self.analyze_status = AnalyzeStatus::Error("Укажите ссылку".into());
+            return;
+        }
+
+        self.analyze_status = AnalyzeStatus::Loading;
+        self.video_info = None;
+        self.thumbnail_texture = None;
+
+        let (tx, rx) = channel();
+        self.analyze_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let result: AnalyzeEvent = downloader::analyze_url(&ytdlp, &url)
+                .map(|info| {
+                    let thumbnail = info
+                        .thumbnail_url
+                        .as_deref()
+                        .and_then(|u| downloader::fetch_thumbnail(u).ok())
+                        .map(|(rgba, size)| ThumbnailData { rgba, size });
+                    AnalyzedInfo {
+                        title: info.title,
+                        playlist_count: info.playlist_count,
+                        thumbnail,
+                    }
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_analyze(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.analyze_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.analyze_rx = None;
+
+        match result {
+            Ok(info) => {
+                if let Some(thumb) = info.thumbnail {
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied(thumb.size, &thumb.rgba);
+                    let texture = ctx.load_texture(
+                        "thumbnail",
+                        color_image,
+                        egui::TextureOptions::default(),
+                    );
+                    self.thumbnail_texture = Some(texture);
+                }
+                self.video_info = Some(VideoPreview {
+                    title: info.title,
+                    playlist_count: info.playlist_count,
+                });
+                self.analyze_status = AnalyzeStatus::Loaded;
+            }
+            Err(e) => {
+                self.analyze_status = AnalyzeStatus::Error(e);
+            }
         }
     }
 
@@ -76,11 +194,19 @@ impl YtDlpApp {
             return;
         }
 
-        self.log.clear();
         self.progress = 0.0;
         self.speed.clear();
         self.eta.clear();
         self.status = Status::Running;
+
+        // Логи пишем не в интерфейс, а в файл рядом со скачанными видео.
+        if std::fs::create_dir_all(&self.settings.output_dir).is_ok() {
+            let log_path = PathBuf::from(&self.settings.output_dir)
+                .join(format!("yt-dlp-gui_{}.log", timestamp()));
+            self.log_file = File::create(&log_path).ok().map(BufWriter::new);
+        } else {
+            self.log_file = None;
+        }
 
         let (tx, rx) = channel();
         self.rx = Some(rx);
@@ -102,7 +228,7 @@ impl YtDlpApp {
         }
         self.running_child = None;
         self.status = Status::Idle;
-        self.log.push("⏹ Загрузка отменена пользователем".into());
+        self.log_line("⏹ Загрузка отменена пользователем");
     }
 
     fn poll_events(&mut self) {
@@ -114,13 +240,11 @@ impl YtDlpApp {
         }
 
         let Some(rx) = &self.rx else { return };
+        let mut lines_to_log: Vec<String> = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match event {
                 DownloadEvent::Log(line) => {
-                    self.log.push(line);
-                    if self.log.len() > 2000 {
-                        self.log.drain(0..500);
-                    }
+                    lines_to_log.push(line);
                 }
                 DownloadEvent::Progress {
                     percent,
@@ -142,13 +266,17 @@ impl YtDlpApp {
                 }
             }
         }
+        for line in lines_to_log {
+            self.log_line(&line);
+        }
     }
 }
 
 impl eframe::App for YtDlpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
-        if matches!(self.status, Status::Running) {
+        self.poll_analyze(ctx);
+        if matches!(self.status, Status::Running) || matches!(self.analyze_status, AnalyzeStatus::Loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
 
@@ -157,6 +285,11 @@ impl eframe::App for YtDlpApp {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("yt-dlp GUI").strong());
                 ui.label(RichText::new("портативный загрузчик видео").weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙ Настройки").clicked() {
+                        self.show_settings = true;
+                    }
+                });
             });
             ui.add_space(6.0);
         });
@@ -167,21 +300,17 @@ impl eframe::App for YtDlpApp {
             });
         }
 
+        self.ui_settings_window(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                self.ui_source_section(ui);
+                self.ui_link_bar(ui);
                 ui.add_space(10.0);
-                self.ui_video_audio_section(ui);
-                ui.add_space(10.0);
-                self.ui_embed_section(ui);
-                ui.add_space(10.0);
-                self.ui_advanced_section(ui);
+                self.ui_preview(ui);
                 ui.add_space(14.0);
                 self.ui_actions(ui);
                 ui.add_space(10.0);
                 self.ui_progress(ui);
-                ui.add_space(10.0);
-                self.ui_log(ui);
             });
         });
     }
@@ -196,20 +325,119 @@ impl YtDlpApp {
             .stroke(Stroke::new(1.0_f32, Color32::from_rgb(50, 50, 56)))
     }
 
-    fn ui_source_section(&mut self, ui: &mut egui::Ui) {
-        self.section_frame().show(ui, |ui| {
-            ui.label(RichText::new("Источник").strong());
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Ссылка (видео или плейлист):");
-            });
+    /// Компактное поле ссылки + кнопка «Анализировать».
+    fn ui_link_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.settings.url)
-                    .hint_text("https://www.youtube.com/watch?v=... или ссылка на плейлист")
-                    .desired_width(f32::INFINITY),
+                    .hint_text("Ссылка на видео или плейлист")
+                    .desired_width((ui.available_width() - 150.0).max(120.0)),
             );
 
-            ui.add_space(8.0);
+            let analyzing = matches!(self.analyze_status, AnalyzeStatus::Loading);
+            let button = egui::Button::new(if analyzing { "Анализ…" } else { "Анализировать" })
+                .fill(ACCENT_COLOR);
+            if ui.add_enabled(!analyzing, button).clicked() {
+                self.start_analyze();
+            }
+        });
+
+        if let AnalyzeStatus::Error(e) = &self.analyze_status {
+            ui.add_space(4.0);
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
+    }
+
+    /// Превью: миниатюра + название + кол-во видео (для плейлиста).
+    fn ui_preview(&mut self, ui: &mut egui::Ui) {
+        self.section_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let size = egui::vec2(160.0, 90.0);
+
+                if let Some(texture) = &self.thumbnail_texture {
+                    let image = egui::Image::new(texture).fit_to_exact_size(size);
+                    let response = ui.add(image);
+
+                    if let Some(count) = self.video_info.as_ref().and_then(|i| i.playlist_count) {
+                        let rect = response.rect;
+                        let badge_size = egui::vec2(56.0, 20.0);
+                        let badge_rect = egui::Rect::from_min_size(
+                            rect.right_bottom() - badge_size - egui::vec2(4.0, 4.0),
+                            badge_size,
+                        );
+                        ui.painter().rect_filled(
+                            badge_rect,
+                            Rounding::same(4.0),
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+                        );
+                        ui.painter().text(
+                            badge_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{count} шт"),
+                            egui::FontId::proportional(11.0),
+                            Color32::WHITE,
+                        );
+                    }
+                } else {
+                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(38, 38, 44));
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Превью",
+                        egui::FontId::proportional(14.0),
+                        Color32::GRAY,
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.vertical(|ui| match &self.video_info {
+                    Some(info) => {
+                        ui.label(RichText::new(&info.title).strong());
+                        if let Some(count) = info.playlist_count {
+                            ui.label(
+                                RichText::new(format!("Плейлист · {count} видео")).weak(),
+                            );
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("Введите ссылку и нажмите «Анализировать»").weak(),
+                        );
+                    }
+                });
+            });
+        });
+    }
+
+    /// Окно настроек (видео/аудио/встраивание/плейлист/доп. параметры),
+    /// открывается кнопкой «⚙ Настройки» в верхней панели.
+    fn ui_settings_window(&mut self, ctx: &egui::Context) {
+        let mut show_settings = self.show_settings;
+        egui::Window::new("Настройки")
+            .open(&mut show_settings)
+            .resizable(true)
+            .collapsible(false)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
+                    self.ui_output_section(ui);
+                    ui.add_space(10.0);
+                    self.ui_video_audio_section(ui);
+                    ui.add_space(10.0);
+                    self.ui_embed_section(ui);
+                    ui.add_space(10.0);
+                    self.ui_advanced_section(ui);
+                });
+            });
+        self.show_settings = show_settings;
+    }
+
+    fn ui_output_section(&mut self, ui: &mut egui::Ui) {
+        self.section_frame().show(ui, |ui| {
+            ui.label(RichText::new("Источник и папка").strong());
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Папка загрузки:");
                 ui.add(
@@ -335,7 +563,7 @@ impl YtDlpApp {
                 .add_enabled(
                     !running,
                     egui::Button::new(RichText::new("  Скачать  ").strong())
-                        .fill(Color32::from_rgb(80, 140, 255)),
+                        .fill(ACCENT_COLOR),
                 )
                 .clicked()
             {
@@ -351,7 +579,7 @@ impl YtDlpApp {
             match &self.status {
                 Status::Idle => {}
                 Status::Running => {
-                    ui.label(RichText::new("⏳ Загрузка…").color(Color32::LIGHT_BLUE));
+                    ui.label(RichText::new("⏳ Загрузка…").color(Color32::LIGHT_GRAY));
                 }
                 Status::Done => {
                     ui.label(RichText::new("✅ Готово").color(Color32::LIGHT_GREEN));
@@ -361,6 +589,12 @@ impl YtDlpApp {
                 }
             }
         });
+
+        if matches!(self.status, Status::Running | Status::Done) {
+            ui.label(
+                RichText::new("Лог сохраняется рядом со скачанными файлами (*.log)").weak(),
+            );
+        }
     }
 
     fn ui_progress(&mut self, ui: &mut egui::Ui) {
@@ -379,18 +613,13 @@ impl YtDlpApp {
             });
         }
     }
+}
 
-    fn ui_log(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Лог").strong());
-        egui::ScrollArea::vertical()
-            .max_height(220.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.log {
-                    ui.label(RichText::new(line).monospace().size(12.0));
-                }
-            });
-    }
+fn timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn apply_dark_theme(ctx: &egui::Context) {
@@ -399,9 +628,9 @@ fn apply_dark_theme(ctx: &egui::Context) {
     visuals.window_fill = Color32::from_rgb(22, 22, 26);
     visuals.extreme_bg_color = Color32::from_rgb(18, 18, 21);
     visuals.widgets.inactive.bg_fill = Color32::from_rgb(38, 38, 44);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(52, 52, 60);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(80, 140, 255);
-    visuals.selection.bg_fill = Color32::from_rgb(80, 140, 255);
+    visuals.widgets.hovered.bg_fill = ACCENT_COLOR_HOVER;
+    visuals.widgets.active.bg_fill = ACCENT_COLOR;
+    visuals.selection.bg_fill = ACCENT_COLOR;
     visuals.window_rounding = Rounding::same(10.0);
     ctx.set_visuals(visuals);
 
