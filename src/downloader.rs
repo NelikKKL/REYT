@@ -217,6 +217,94 @@ pub struct VideoInfo {
     pub thumbnail_url: Option<String>,
     /// Заполнено, только если ссылка ведёт на плейлист.
     pub playlist_count: Option<u64>,
+    /// Реально найденные звуковые дорожки (язык + пометка), взятые из
+    /// списка форматов, которые yt-dlp вернул при анализе.
+    pub audio_tracks: Vec<AudioTrack>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioTrack {
+    /// Код языка, как его отдал yt-dlp (напр. "ru", "en-US").
+    pub code: String,
+    /// Доп. пометка формата, если есть (напр. "original", "dubbed").
+    pub note: Option<String>,
+}
+
+impl AudioTrack {
+    /// Человекочитаемая подпись для выпадающего списка.
+    pub fn display_label(&self) -> String {
+        let name = language_name(&self.code).unwrap_or(&self.code);
+        match &self.note {
+            Some(note) if !note.trim().is_empty() => format!("{name} — {note}"),
+            _ => name.to_string(),
+        }
+    }
+}
+
+/// Небольшой словарь распространённых языковых кодов для читаемых подписей.
+/// Если код не найден — показываем его как есть.
+fn language_name(code: &str) -> Option<&'static str> {
+    let base = code.split(['-', '_']).next().unwrap_or(code).to_lowercase();
+    Some(match base.as_str() {
+        "ru" => "Русский",
+        "en" => "Английский",
+        "uk" => "Украинский",
+        "es" => "Испанский",
+        "fr" => "Французский",
+        "de" => "Немецкий",
+        "it" => "Итальянский",
+        "pt" => "Португальский",
+        "ja" => "Японский",
+        "ko" => "Корейский",
+        "zh" => "Китайский",
+        "ar" => "Арабский",
+        "hi" => "Хинди",
+        "tr" => "Турецкий",
+        "pl" => "Польский",
+        _ => return None,
+    })
+}
+
+/// Извлекает уникальные звуковые дорожки из списка форматов в JSON-ответе
+/// yt-dlp (поле "formats"). Берём только форматы, где действительно есть
+/// аудиодорожка (acodec != "none"), и у которых указан язык.
+fn extract_audio_tracks(value: &serde_json::Value) -> Vec<AudioTrack> {
+    let mut seen = std::collections::HashSet::new();
+    let mut tracks = Vec::new();
+
+    let Some(formats) = value.get("formats").and_then(|f| f.as_array()) else {
+        return tracks;
+    };
+
+    for format in formats {
+        let has_audio = format
+            .get("acodec")
+            .and_then(|v| v.as_str())
+            .map(|s| s != "none")
+            .unwrap_or(false);
+        if !has_audio {
+            continue;
+        }
+
+        let Some(lang) = format.get("language").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if lang.trim().is_empty() || !seen.insert(lang.to_string()) {
+            continue;
+        }
+
+        let note = format
+            .get("format_note")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        tracks.push(AudioTrack {
+            code: lang.to_string(),
+            note,
+        });
+    }
+
+    tracks
 }
 
 /// Быстро получает метаданные по ссылке без скачивания самого видео.
@@ -286,11 +374,13 @@ pub fn analyze_url(ytdlp_path: &PathBuf, url: &str) -> anyhow::Result<VideoInfo>
         });
 
     let playlist_count = value.get("playlist_count").and_then(|v| v.as_u64());
+    let audio_tracks = extract_audio_tracks(&value);
 
     Ok(VideoInfo {
         title,
         thumbnail_url,
         playlist_count,
+        audio_tracks,
     })
 }
 

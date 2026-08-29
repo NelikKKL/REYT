@@ -38,6 +38,11 @@ pub struct YtDlpApp {
     analyze_rx: Option<Receiver<AnalyzeEvent>>,
     video_info: Option<VideoPreview>,
     thumbnail_texture: Option<egui::TextureHandle>,
+    audio_tracks: Vec<downloader::AudioTrack>,
+    /// URL, для которого сейчас действителен результат анализа. Пока текст
+    /// в поле ссылки не совпадает с этим значением — «Скачать» и «Настройки»
+    /// заблокированы, так как данные могут относиться к другому видео.
+    analyzed_url: String,
 
     show_settings: bool,
     show_advanced: bool,
@@ -70,9 +75,11 @@ struct ThumbnailData {
 }
 
 struct AnalyzedInfo {
+    source_url: String,
     title: String,
     playlist_count: Option<u64>,
     thumbnail: Option<ThumbnailData>,
+    audio_tracks: Vec<downloader::AudioTrack>,
 }
 
 type AnalyzeEvent = Result<AnalyzedInfo, String>;
@@ -105,6 +112,8 @@ impl YtDlpApp {
             analyze_rx: None,
             video_info: None,
             thumbnail_texture: None,
+            audio_tracks: Vec::new(),
+            analyzed_url: String::new(),
             show_settings: false,
             show_advanced: false,
         }
@@ -115,6 +124,19 @@ impl YtDlpApp {
             let _ = writeln!(writer, "{line}");
             let _ = writer.flush();
         }
+    }
+
+    fn is_analyzed(&self) -> bool {
+        matches!(self.analyze_status, AnalyzeStatus::Loaded)
+            && self.analyzed_url == self.settings.url.trim()
+    }
+
+    fn invalidate_analysis(&mut self) {
+        self.analyzed_url.clear();
+        self.video_info = None;
+        self.thumbnail_texture = None;
+        self.audio_tracks.clear();
+        self.analyze_status = AnalyzeStatus::Idle;
     }
 
     fn start_analyze(&mut self) {
@@ -129,8 +151,10 @@ impl YtDlpApp {
         }
 
         self.analyze_status = AnalyzeStatus::Loading;
+        self.analyzed_url.clear();
         self.video_info = None;
         self.thumbnail_texture = None;
+        self.audio_tracks.clear();
 
         let (tx, rx) = channel();
         self.analyze_rx = Some(rx);
@@ -144,9 +168,11 @@ impl YtDlpApp {
                         .and_then(|u| downloader::fetch_thumbnail(u).ok())
                         .map(|(rgba, size)| ThumbnailData { rgba, size });
                     AnalyzedInfo {
+                        source_url: url.clone(),
                         title: info.title,
                         playlist_count: info.playlist_count,
                         thumbnail,
+                        audio_tracks: info.audio_tracks,
                     }
                 })
                 .map_err(|e| e.to_string());
@@ -171,6 +197,8 @@ impl YtDlpApp {
                     );
                     self.thumbnail_texture = Some(texture);
                 }
+                self.audio_tracks = info.audio_tracks;
+                self.analyzed_url = info.source_url;
                 self.video_info = Some(VideoPreview {
                     title: info.title,
                     playlist_count: info.playlist_count,
@@ -191,6 +219,10 @@ impl YtDlpApp {
         };
         if self.settings.url.trim().is_empty() {
             self.status = Status::Error("Укажите ссылку".into());
+            return;
+        }
+        if !self.is_analyzed() {
+            self.status = Status::Error("Сначала нажмите «Анализировать»".into());
             return;
         }
 
@@ -286,7 +318,13 @@ impl eframe::App for YtDlpApp {
                 ui.heading(RichText::new("yt-dlp GUI").strong());
                 ui.label(RichText::new("портативный загрузчик видео").weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ Настройки").clicked() {
+                    let settings_button = ui.add_enabled(
+                        self.is_analyzed(),
+                        egui::Button::new("⚙ Настройки"),
+                    );
+                    let settings_button = settings_button
+                        .on_disabled_hover_text("Сначала проанализируйте ссылку");
+                    if settings_button.clicked() {
                         self.show_settings = true;
                     }
                 });
@@ -328,11 +366,17 @@ impl YtDlpApp {
     /// Компактное поле ссылки + кнопка «Анализировать».
     fn ui_link_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.add(
+            let response = ui.add(
                 egui::TextEdit::singleline(&mut self.settings.url)
                     .hint_text("Ссылка на видео или плейлист")
                     .desired_width((ui.available_width() - 150.0).max(120.0)),
             );
+            if response.changed() {
+                // Ссылка изменилась вручную — старый результат анализа больше
+                // не гарантированно относится к этому видео, блокируем
+                // скачивание и настройки до повторного анализа.
+                self.invalidate_analysis();
+            }
 
             let analyzing = matches!(self.analyze_status, AnalyzeStatus::Loading);
             let button = egui::Button::new(if analyzing { "Анализ…" } else { "Анализировать" })
@@ -504,10 +548,44 @@ impl YtDlpApp {
                     }
                 });
 
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label("Язык звуковой дорожки (код, напр. ru, en; пусто = любой):");
-                ui.text_edit_singleline(&mut self.settings.audio_language);
+                ui.label("Звуковая дорожка:");
+                let selected_label = if self.settings.audio_language.trim().is_empty() {
+                    "Любая / оригинал".to_string()
+                } else {
+                    self.audio_tracks
+                        .iter()
+                        .find(|t| t.code == self.settings.audio_language)
+                        .map(|t| t.display_label())
+                        .unwrap_or_else(|| self.settings.audio_language.clone())
+                };
+                egui::ComboBox::from_id_source("audio_track_combo")
+                    .selected_text(selected_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.settings.audio_language,
+                            String::new(),
+                            "Любая / оригинал",
+                        );
+                        for track in &self.audio_tracks {
+                            let label = track.display_label();
+                            ui.selectable_value(
+                                &mut self.settings.audio_language,
+                                track.code.clone(),
+                                label,
+                            );
+                        }
+                    });
             });
+            if self.audio_tracks.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "Реальные дорожки появятся здесь после анализа ссылки",
+                    )
+                    .weak(),
+                );
+            }
         });
     }
 
@@ -559,14 +637,14 @@ impl YtDlpApp {
     fn ui_actions(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let running = matches!(self.status, Status::Running);
-            if ui
-                .add_enabled(
-                    !running,
-                    egui::Button::new(RichText::new("  Скачать  ").strong())
-                        .fill(ACCENT_COLOR),
-                )
-                .clicked()
-            {
+            let can_download = !running && self.is_analyzed();
+            let download_button = ui.add_enabled(
+                can_download,
+                egui::Button::new(RichText::new("  Скачать  ").strong()).fill(ACCENT_COLOR),
+            );
+            let download_button =
+                download_button.on_disabled_hover_text("Сначала нажмите «Анализировать»");
+            if download_button.clicked() {
                 self.start_download();
             }
             if ui
@@ -589,6 +667,13 @@ impl YtDlpApp {
                 }
             }
         });
+
+        if !self.is_analyzed() && !matches!(self.status, Status::Running) {
+            ui.label(
+                RichText::new("Проанализируйте ссылку, чтобы стали доступны настройки и скачивание")
+                    .weak(),
+            );
+        }
 
         if matches!(self.status, Status::Running | Status::Done) {
             ui.label(
