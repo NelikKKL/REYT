@@ -193,7 +193,7 @@ impl YtDlpApp {
             .fill(Color32::from_rgb(30, 30, 34))
             .rounding(Rounding::same(10.0))
             .inner_margin(egui::Margin::same(12.0))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 56)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(50, 50, 56)))
     }
 
     fn ui_source_section(&mut self, ui: &mut egui::Ui) {
